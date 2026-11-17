@@ -1,5 +1,5 @@
 use crate::collision_detection::CDEConfig;
-use crate::entities::Container;
+use crate::entities::{Container, InferiorQualityZone};
 use crate::geometry::primitives::{Point, Rect, SPolygon};
 use crate::geometry::shape_modification::{ShapeModifyConfig, ShapeModifyMode};
 use crate::geometry::{DTransformation, OriginalShape};
@@ -21,6 +21,9 @@ pub struct Strip {
     /// Fixed outline of the sheet, if it is not a plain rectangle. `'static`
     /// so the strip stays `Copy`; callers intern their outlines (leak once).
     pub outline: Option<&'static [Point]>,
+    /// Holes in the sheet (parts already cut out of an offcut), each a simple
+    /// polygon inside the outline. Interned like `outline`.
+    pub holes: Option<&'static [&'static [Point]]>,
 }
 
 impl Strip {
@@ -38,6 +41,7 @@ impl Strip {
             shape_modify_config,
             width,
             outline: None,
+            holes: None,
         })
     }
 
@@ -47,6 +51,16 @@ impl Strip {
         ensure!(outline.len() >= 3, "sheet outline needs at least 3 points");
         SPolygon::new(outline.to_vec())?;
         self.outline = Some(outline);
+        Ok(self)
+    }
+
+    /// The sheet's holes: no part may lie over them.
+    pub fn with_holes(mut self, holes: &'static [&'static [Point]]) -> Result<Self> {
+        for h in holes {
+            ensure!(h.len() >= 3, "a sheet hole needs at least 3 points");
+            SPolygon::new(h.to_vec())?;
+        }
+        self.holes = if holes.is_empty() { None } else { Some(holes) };
         Ok(self)
     }
 
@@ -62,6 +76,25 @@ impl From<Strip> for Container {
             Some(points) => SPolygon::new(points.to_vec()).unwrap(),
             None => SPolygon::from(Rect::try_new(0.0, 0.0, s.width, s.fixed_height).unwrap()),
         };
+        let quality_zones = match s.holes {
+            Some(holes) => vec![
+                InferiorQualityZone::new(
+                    0,
+                    holes
+                        .iter()
+                        .map(|h| OriginalShape {
+                            shape: SPolygon::new(h.to_vec()).unwrap(),
+                            pre_transform: DTransformation::empty(),
+                            // a hole may only grow when simplified: parts stay off it
+                            modify_mode: ShapeModifyMode::Inflate,
+                            modify_config: s.shape_modify_config,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ],
+            None => vec![],
+        };
         Container::new(
             0,
             OriginalShape {
@@ -70,7 +103,7 @@ impl From<Strip> for Container {
                 modify_mode: ShapeModifyMode::Deflate,
                 modify_config: s.shape_modify_config,
             },
-            vec![],
+            quality_zones,
             s.cde_config,
         )
         .unwrap()
